@@ -1,0 +1,163 @@
+/*******************************************************************************************
+* @author           
+* @version          2.0 
+* @date             29-MAR-2023
+* @Status           Developed
+* @Class Name       usopc_ContentDocumentLinkTrigger
+* @description      
+*********************************************************************************************
+ Version     Date      Team          Comments
+*********************************************************************************************
+* 2        Mar 2023    Suman         UOC-467 
+* 1                   				Initial Creation
+*********************************************************************************************/
+trigger usopc_ContentDocumentLinkTrigger on ContentDocumentLink (after insert) {
+    try {
+        Boolean onOffSetting = usopc_TriggerOnOffSettings.getTriggerOnOffValue('Contact_Document_Link_Trigger');
+        if (onOffSetting) {
+            List<usopc_SharePoint_File_Confi__c> fileConfigs = [select Id, Name, usopc_File_Name__c, usopc_Folder_Name__c from usopc_SharePoint_File_Confi__c LIMIT 9000];
+            Map<String,String> mapFileFolderName = new Map<String,String>();
+            //Fill Map of FileName and FolderName
+            for(usopc_SharePoint_File_Confi__c fileConfig : fileConfigs){
+                mapFileFolderName.put(fileConfig.usopc_File_Name__c.toLowerCase(), fileConfig.usopc_Folder_Name__c);
+            }
+            
+            list<ContentDocumentLink> contentList = new list<ContentDocumentLink>();
+            Map<Id,Id> mapContactContentDocId = new Map<Id,Id>();
+            Map<Id,Id> mapConDocIdAndProfDocId = new Map<Id,Id>();//UOC:467- Map name changed from mapProfessionalDocumentsId to mapConDocIdAndProfDocId for better readability
+            for(ContentDocumentLink nt : trigger.new){
+                string pId = string.valueOf(nt.linkedentityid).substring(0,3);
+                String sObjName = nt.linkedentityid.getSObjectType().getDescribe().getName();
+                if(pid == '003'){
+                    mapContactContentDocId.put(nt.ContentDocumentId,nt.linkedentityid);
+                }else if(sObjName.containsIgnoreCase('Professional_Documents')){//
+                    mapConDocIdAndProfDocId.put(nt.ContentDocumentId,nt.linkedentityid);
+                }
+            }
+            
+            map<id,String> conNameMap = new map<id,String>();
+            if(!mapContactContentDocId.isEmpty()){
+                for(Contact cont : [select Id, Name,  usopc_Legal_First_Name__c, usopc_Legal_Last_Name__c from Contact where id in : mapContactContentDocId.values()]){
+                    conNameMap.put(cont.id, cont.usopc_Legal_First_Name__c + '_'+ cont.usopc_Legal_Last_Name__c + '_' + cont.id);
+                }
+                map<Id, ContentDocument> mapContentDocuments = new map<Id, ContentDocument>([SELECT Id, Title, FileExtension FROM ContentDocument WHERE Id IN :mapContactContentDocId.keySet()]);
+                
+                list<ContentDocument> listUpdate = new list<ContentDocument>();
+                
+                Map<String,ContentDocument> mapConCntDoc = new Map<String,ContentDocument>();
+                for(Id CntDocId : mapContactContentDocId.keySet())
+                {
+                    String conId = mapContactContentDocId.get(CntDocId);
+                    ContentDocument objCntDoc = mapContentDocuments.get(CntDocId);
+                    String fileName = objCntDoc.Title+'.'+ objCntDoc.FileExtension;
+                    System.debug('fileName--'+fileName);
+                    if(!String.isBlank(fileName)) {
+                        for(String fNameSetting : mapFileFolderName.keySet()){
+                            if(fileName.containsIgnoreCase(fNameSetting) || fNameSetting.containsIgnoreCase(fileName)){
+                                mapConCntDoc.put(conId+'---'+objCntDoc.Id, objCntDoc);
+                            }
+                        }
+                    }
+                }
+                //Process Data
+                System.debug('mapConCntDoc'+mapConCntDoc);
+                if(!mapConCntDoc.isEmpty()){
+                    List<ContentVersion> lstContentVersion = [SELECT ContentDocumentId, VersionData FROM ContentVersion WHERE ContentDocumentId = :mapConCntDoc.values() AND IsLatest = true];
+                    Map<Id,ContentVersion> MapConVer = new Map<Id,ContentVersion>();
+                    for(ContentVersion conVer : lstContentVersion){
+                        MapConVer.put(conVer.ContentDocumentId,conVer);
+                    }
+                    for(String conCntDocId : mapConCntDoc.keySet()){
+                        ContentDocument objCntDoc = mapConCntDoc.get(conCntDocId);
+                        String conId = conCntDocId.split('---')[0];
+                        
+                        String fileName = objCntDoc.Title+'.'+ objCntDoc.FileExtension;
+                        String lFileName = fileName.toLowerCase();
+                        String driveName = '';
+                        for(String fNameSetting : mapFileFolderName.keySet()){
+                            if(lFileName.containsIgnoreCase(fNameSetting) || fNameSetting.containsIgnoreCase(lFileName)){
+                                driveName = mapFileFolderName.get(fNameSetting);
+                            }
+                        }
+                        String conName = conNameMap.get(conId);
+                        //Call API and send file to Share point
+                        System.debug('driveName'+driveName);
+                        System.debug('conName'+conName);
+                        System.debug('fileName'+fileName);
+                        System.debug('ContentDocId'+objCntDoc.Id);
+                        System.debug('ContentVersionId'+MapConVer.get(objCntDoc.Id).Id);
+                        usopc_SharePointFileController.uploadFileFromAttachment(driveName,conName,fileName,MapConVer.get(objCntDoc.Id).VersionData, objCntDoc.Id);
+                    }
+                }
+            }
+            
+            /***********************Added by Demandblue for UOC-467 **********************************/
+            /*Professional Document record(LinkedEntityId to the Uploaded Doc) is connected to Application record. 
+			  Get the folder name(based on Contact ass with Application) and drive name(based on App record type) */
+            if(!mapConDocIdAndProfDocId.isEmpty()){
+                //Get the Professional Docs(LinkedEntityId) records to get Application rec details
+                Map<Id, usopc_Professional_Documents__c> profDocIdAndRecMap = usopc_ContentDocumentLinkTriggerHelper.getProfDocIdAndRecDetailMap(mapConDocIdAndProfDocId.values());
+                //Get ContentDocument & Content Version records to get file details
+                Map<Id, ContentDocument> contentDocIdAndRecMap = new Map<Id, ContentDocument>([SELECT Id, Title, FileExtension FROM ContentDocument WHERE Id IN :mapConDocIdAndProfDocId.keySet()]);
+                Map<Id,ContentVersion> conDocIDAndConVersionMap = usopc_ContentDocumentLinkTriggerHelper.getContentDocIdAndContentVersionMap(contentDocIdAndRecMap.keySet());
+                
+                //Process the Documents and save in Sharepoint
+                for(Id contentDocId : mapConDocIdAndProfDocId.keySet()){
+                    //Get File Name
+                    ContentDocument conDocRec = contentDocIdAndRecMap.get(contentDocId);
+                    String fileName = conDocRec.Title+'.'+ conDocRec.FileExtension;
+                    //Get Contact Folder Name
+                    String profDocId = mapConDocIdAndProfDocId.get(contentDocId);//LinkedEntityId
+                    String contactFolderName = profDocIdAndRecMap.get(profDocId).Contact_Folder_Name_Sharepoint__c;
+                    //Get Drive Name
+                    String applicationRecTypeName = profDocIdAndRecMap.get(profDocId).Application_Record_Type__c;
+                    String driveName = usopc_ContentDocumentLinkTriggerHelper.getDriveNameBasedOnAppRecType(applicationRecTypeName);
+                    
+                    System.debug('driveName'+driveName);
+                    System.debug('contactFolderName'+contactFolderName);
+                    System.debug('fileName'+fileName);
+                    System.debug('ContentDocId'+contentDocId);
+                    System.debug('ContentVersionId'+conDocIDAndConVersionMap.get(contentDocId).Id);
+                    usopc_SharePointFileController.uploadFileFromAttachment(driveName, contactFolderName, fileName, conDocIDAndConVersionMap.get(contentDocId).VersionData,'');
+                }
+            }
+            
+            /****************************************************************************************/  
+            
+            /*Commented by Demandblue for UOC-467(as this code is not required now)
+             * Professional Documents Record
+            if(!mapProfessionalDocumentsId.isEmpty()){
+                map<Id, ContentDocument> mapContentDocuments = new map<Id, ContentDocument>([SELECT Id, Title, FileExtension FROM ContentDocument WHERE Id IN :mapProfessionalDocumentsId.keySet()]);
+                
+                list<ContentDocument> listUpdate = new list<ContentDocument>();
+                
+                Map<String,ContentDocument> mapProfDocCntDoc = new Map<String,ContentDocument>();
+                for(Id ProfDocCntId : mapProfessionalDocumentsId.keySet()){
+                    String profDocId = mapProfessionalDocumentsId.get(ProfDocCntId);
+                    ContentDocument objCntDoc = mapContentDocuments.get(ProfDocCntId);
+                    mapProfDocCntDoc.put(profDocId+'---'+objCntDoc.Id, objCntDoc);
+                }
+                //Process Data
+                System.debug('mapProfDocCntDoc'+mapProfDocCntDoc);
+                if(!mapProfDocCntDoc.isEmpty()){
+                    List<ContentVersion> lstContentVersion = [SELECT ContentDocumentId, VersionData FROM ContentVersion WHERE ContentDocumentId = :mapProfDocCntDoc.values() AND IsLatest = true];
+                    Map<Id,ContentVersion> MapConVer = new Map<Id,ContentVersion>();
+                    for(ContentVersion conVer : lstContentVersion){
+                        MapConVer.put(conVer.ContentDocumentId,conVer);
+                    }
+                    for(String profCntDocId : mapProfDocCntDoc.keySet()){
+                        ContentDocument objCntDoc = mapProfDocCntDoc.get(profCntDocId);
+                        //String profDocRecId = profCntDocId.split('---')[0];
+                        String fileName = objCntDoc.Title+'.'+ objCntDoc.FileExtension;
+                        System.debug('fileName'+fileName);
+                        usopc_SharePointFileController.uploadFileFromAttachmentProfDocuments(fileName,MapConVer.get(objCntDoc.Id).VersionData, objCntDoc.Id);
+                    }
+                }
+            }*/
+        }
+    } catch(Exception ex) {
+        Logger.error('Error on usopc_ContentDocumentLinkTrigger Trigger', ex);
+        Logger.saveLog();
+        System.debug(ex.getMessage());
+    }
+}
